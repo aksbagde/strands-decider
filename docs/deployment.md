@@ -8,7 +8,7 @@ this page gives measurements and the problems found, not a complete container.
 - [Which host](#which-host): one table, measured.
 - [SageMaker AI real-time endpoints](#sagemaker-ai-real-time-endpoints): the aws-samples example and the GPU driver.
 - [Amazon Bedrock AgentCore Runtime](#amazon-bedrock-agentcore-runtime): GPU Instances, or CPU microVMs.
-- [AWS Lambda MicroVMs](#aws-lambda-microvms): the fastest CPU host measured, with a snapshot trap.
+- [AWS Lambda MicroVMs](#aws-lambda-microvms): the fastest CPU host measured; prime the model before the snapshot.
 - [Calling the model](#calling-the-model): the routes each host expects, and who can call it.
 - [When it pays for itself](#when-it-pays-for-itself): break-even against an LLM call.
 - [Serving notes for every host](#serving-notes-for-every-host).
@@ -24,11 +24,10 @@ table and Lambda MicroVMs all scored 72% on routing, and the AgentCore Runtime m
 them on the 20 items it ran.
 
 These are field measurements by one person, not a benchmark. Re-measure before you size a
-production deployment. Every CPU row served the model in fp32, upcast one decoder layer at a time
-with the embedding table left in bf16 (on the 8 GB AgentCore Runtime microVM, the package's
-default upcast was killed; see below).
-[#48](https://github.com/strands-labs/strands-decider/pull/48) would add an opt-in bf16 mode for
-Graviton, which was not measured here.
+production deployment. On the AgentCore Runtime microVM, the model was served in fp32, upcast one
+decoder layer at a time with the embedding table left in bf16, because the package's default
+upcast was killed in 8 GB. On Lambda MicroVMs it was measured in both fp32 and bf16, with the same
+answers (see below).
 
 ## Which host
 
@@ -40,7 +39,7 @@ five-way routing choice and a yes/no scope check), on hobson-v19 in eu-west-1.
 | SageMaker AI real-time endpoint | `ml.g6.xlarge`, NVIDIA L4 | 131 ms | Always on | 5 Oct 2026 |
 | AgentCore Runtime Instances | `g4dn.xlarge`, NVIDIA T4 | 475 ms | 174–194 s per new session; 3.7 min for the first call | 5 Oct 2026 |
 | SageMaker AI real-time endpoint | `ml.g4dn.xlarge`, NVIDIA T4 | 483 ms | Always on | 5 Oct 2026 |
-| Lambda MicroVMs | Graviton, 8 GB / 4 vCPU baseline (the largest), bursts to 32 GB / 16 vCPU | 2.35 s | 5.6–6.7 s from a snapshot to running; about 7 min for the first decision on a new MicroVM | 7 Oct 2026 |
+| Lambda MicroVMs | Graviton, 8 GB / 4 vCPU baseline (the largest), bursts to 32 GB / 16 vCPU | 2.8 s (bf16); 2.35 s (fp32) | 6–7 s from a snapshot to running; first decision in 1.6–1.9 s with the model primed before the snapshot | 7 and 10 Oct 2026 |
 | AgentCore Runtime microVM, original runtime (V1) | 2 vCPU, 8 GB, CPU | 9.1 s | 10–17 s per new session | 5 Oct 2026 |
 
 All rows ran one FastAPI wrapper around the package's engine, built for these tests (see
@@ -60,7 +59,7 @@ The example's README calls it an evaluation example to review before production.
   expects `hobson_config.json`. The newer models ship `strands_decider_config.json` instead, so
   changing the model id alone does not work.
 - **Its latency check is a smoke test.** The notebook reported a median warm server latency of
-  147–149 ms on `ml.g6.xlarge` and 162 ms on `ml.g5.xlarge` on 8 Oct 2026
+  147 and 149 ms on `ml.g6.xlarge` and 162 ms on `ml.g5.xlarge` on 8 Oct 2026
   ([aws-samples #264](https://github.com/aws-samples/sagemaker-genai-hosting-examples/pull/264)).
   That is the median of three repeats of a three-question example request, so it is not
   comparable with the table above.
@@ -77,7 +76,8 @@ The example's README calls it an evaluation example to review before production.
 **Runtime Instances** run the container on EC2 instances that AgentCore manages in your account,
 through a capacity provider. GPU instance types are optional, and the container can be `x86_64` or
 `arm64`. On a T4, a decision took 475 ms, but each new session took about 3 minutes to start, so
-reuse one warm session. Six setup problems came up (5 Oct 2026):
+reuse one warm session. Six setup problems came up. They reflect platform behaviour on 5 Oct 2026,
+so re-check them:
 
 1. The 2 GB image limit applies, and CUDA PyTorch alone is about 4 GB. Ship a small image and copy
    PyTorch (built for the image's Python version) and the weights from S3 at start-up.
@@ -105,25 +105,39 @@ the embedding table left in bf16, stayed under the limit and gave the same answe
 ## AWS Lambda MicroVMs
 
 Lambda MicroVMs start from a snapshot of the running application, so the model loads once, at
-build time. Warm, a decision took 2.35 s (server p50; client p95 2.7 s; 100 items, 16 threads),
-and after a suspend, the first request took 2.32 s (server; 2.37 s client).
+build time. With the setup below, a brand-new MicroVM answered its first request 7–9 s after it
+was started (measured 10 Oct 2026).
 
-- **Snapshot in bf16, upcast after restore.** A snapshot of the fp32 model (about 7.5 GB resident)
-  was taken, but the builds failed: MicroVMs restored from it terminated before starting at the
-  8 GB baseline. A bf16 snapshot (under 1 GB resident) with the fp32 upcast on the first request
-  worked. Do not skip the upcast: served in bf16, the first decision took 7 min 49 s and the second
-  over 2.5 minutes.
-- **The first decision on a new MicroVM took about 7 minutes.** Memory pages are read from the
-  snapshot on first touch: the upcast took 402 s and 429 s on two fresh MicroVMs, against about
-  3 s during the build. The endpoint also did not return that first response (the server logged
-  200; the client never received it). Send a warm-up request and wait for it to finish before real
-  traffic, then suspend the MicroVM when idle rather than starting one per request.
-- **Do not move the upcast into the run hook.** The run hook's timeout is at most 60 s
-  ([MicrovmHooks](https://docs.aws.amazon.com/lambda/latest/microvm-api/API_MicrovmHooks.html)),
-  far less than the upcast takes on a fresh MicroVM. In our test, enabling the run hook also made
-  the image build fail with "Ready hook invocation timed out after PT30M" (30 minutes is the ready
-  timeout we set), although `/ready` had returned 200 within a minute; we did not find the cause.
-  This build failure is reported on this page only, not in the linked write-ups.
+- **Serve in bf16.** A snapshot of the fp32 model (about 7.5 GB resident; 9.35 GB at peak) was
+  taken, but the builds failed: MicroVMs restored from it terminated before starting at the 8 GB
+  baseline. Keeping the model in bf16 (under 1 GB resident) and serving it in bf16 worked: on
+  Graviton with PyTorch 2.14, bf16 gave the same answers as fp32 on all 100 routing items, at
+  2.8 s per decision warm instead of 2.35 s. Serving bf16 means turning off the package's CPU upcast
+  to fp32; we did that in code, and
+  [#48](https://github.com/strands-labs/strands-decider/pull/48) would make it an option.
+- **Prime the model before the snapshot.** Lambda calls two hooks while it builds the image:
+  `/ready` before it takes the snapshot, and `/validate` on a test MicroVM started from that
+  snapshot ([image build hooks](https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html)).
+  Load the model and run a couple of real inferences before `/ready` returns 200, so the snapshot
+  holds a model that has already answered. Then run one more inference in `/validate`: Lambda
+  records which parts of the snapshot the application reads there and prefetches them when later
+  MicroVMs start. The run hook is no place for this work: its timeout is at most 60 s
+  ([MicrovmHooks](https://docs.aws.amazon.com/lambda/latest/microvm-api/API_MicrovmHooks.html)).
+- **Return 503 from the hooks while the work runs.** Lambda polls both hooks, so return 503 straight
+  away, do the work in a background thread, and return 200 when it is done. When our `/validate`
+  ran the inference inside the request, every build failed with "MicroVM terminated before it
+  started". Our builds had also been staging a second checkpoint by mistake (9.3 GB of weights
+  instead of 4.7 GB), and builds with the warm-up only passed once that was fixed too.
+- **Speed.** From `run-microvm` to RUNNING took 6–7 s. With the model primed before the snapshot,
+  the first request on a brand-new MicroVM took 1.6–1.9 s on four MicroVMs (a short two-question
+  request), the same as the second request on each. Two earlier setups were much slower: with
+  nothing in `/validate`, the first decision took about 7 minutes (the upcast took 402–429 s,
+  against 3 s during the build, while memory pages were read from the snapshot), and the endpoint
+  dropped that response; with an inference in `/validate` but none before the snapshot, it took
+  about 48 s. Warm, a decision took 2.8 s in bf16, and 2.35 s in fp32 (server p50; p95 2.7 s;
+  100 items). A suspended MicroVM resumed and answered in 2.4 s.
+
+That is fast enough to scale from zero; keep one MicroVM suspended if you need answers sooner.
 
 ## Calling the model
 
@@ -159,9 +173,10 @@ def invocations(body: dict):
     return out.model_dump()
 ```
 
-Run it with `uvicorn app:app --host 0.0.0.0 --port 8080`. On the CPU hosts we also replaced the
-package's fp32 upcast with a per-layer one, which this snippet leaves out. On Lambda MicroVMs the
-same app served on port 8080, with routes added for the image build hooks.
+Run it with `uvicorn app:app --host 0.0.0.0 --port 8080`. The snippet leaves out two things we added
+for the CPU hosts: on the AgentCore Runtime microVM, a per-layer fp32 upcast in place of the
+package's; on Lambda MicroVMs, bf16 serving and the priming inferences before the server starts,
+plus routes for the image build hooks. On Lambda MicroVMs the same app served on port 8080.
 
 **Who can call it.** `serve` has no authentication of its own, so access control comes from the
 host:
@@ -197,7 +212,7 @@ and the 8 Oct SageMaker AI figures in
 ## Serving notes for every host
 
 - **Check that a GPU deployment is on the GPU.** On both AgentCore and SageMaker AI, the first GPU
-  deployments ran on CPU at about 5.6–5.7 s a decision, with no deployment error. Log
+  deployments ran on CPU at about 5.5 s a decision, with no deployment error. Log
   `torch.cuda.get_device_name(0)` at start-up and fail the health check if a GPU host has no GPU.
 - **Serialise requests.** Until [#17](https://github.com/strands-labs/strands-decider/issues/17)
   is fixed, overlapping requests can receive each other's answers, so put a lock around `evaluate`.

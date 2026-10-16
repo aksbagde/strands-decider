@@ -154,7 +154,7 @@ from strands_decider.infer import load_engine
 from strands_decider.schema import SystemOneRequest
 
 ENGINE = load_engine("/opt/model/decider", device="cuda")  # a local checkpoint folder
-LOCK = threading.Lock()  # see #17
+LOCK = threading.Lock()  # our runs served one request at a time
 app = FastAPI()
 
 
@@ -214,8 +214,12 @@ and the 8 Oct SageMaker AI figures in
 - **Check that a GPU deployment is on the GPU.** On both AgentCore and SageMaker AI, the first GPU
   deployments ran on CPU at about 5.5 s a decision, with no deployment error. Log
   `torch.cuda.get_device_name(0)` at start-up and fail the health check if a GPU host has no GPU.
-- **Serialise requests.** Until [#17](https://github.com/strands-labs/strands-decider/issues/17)
-  is fixed, overlapping requests can receive each other's answers, so put a lock around `evaluate`.
+- **Overlapping requests.** Overlapping requests could receive each other's answers
+  ([#17](https://github.com/strands-labs/strands-decider/issues/17)) until
+  [#18](https://github.com/strands-labs/strands-decider/pull/18) fixed it on 14 Oct 2026. Every
+  measurement on this page predates that fix and served one request at a time behind a lock.
+  `strands-decider serve` now serialises requests only on MPS (the lock from
+  [#68](https://github.com/strands-labs/strands-decider/pull/68), narrowed by #18).
 - **Hosts with no internet access.** The checkpoint names its base model by Hub id, so by default
   the base model (a 4.55 GB file) downloads from Hugging Face at start-up. The aws-samples
   network-isolated notebook stages a revision-pinned Hugging Face cache in S3 and sets
